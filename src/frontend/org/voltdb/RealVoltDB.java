@@ -1888,7 +1888,6 @@ public class RealVoltDB implements VoltDBInterface, RestoreAgent.Callback, Mailb
         final long megabytes = m_executionSiteRecoveryTransferred / (1024 * 1024);
         final double megabytesPerSecond = megabytes / ((m_executionSiteRecoveryFinish - m_recoveryStartTime) / 1000.0);
         for (ClientInterface intf : getClientInterfaces()) {
-            intf.mayActivateSnapshotDaemon();
             try {
                 intf.startAcceptingConnections();
             } catch (IOException e) {

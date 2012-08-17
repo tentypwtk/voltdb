@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
@@ -37,7 +38,6 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.zookeeper_voltpatches.CreateMode;
 import org.apache.zookeeper_voltpatches.KeeperException;
-import org.apache.zookeeper_voltpatches.KeeperException.NodeExistsException;
 import org.apache.zookeeper_voltpatches.WatchedEvent;
 import org.apache.zookeeper_voltpatches.Watcher;
 import org.apache.zookeeper_voltpatches.Watcher.Event.EventType;
@@ -123,8 +123,9 @@ public class SnapshotDaemon implements SnapshotCompletionInterest, Promotable {
 
     private final SimpleDateFormat m_dateFormat = new SimpleDateFormat("'_'yyyy.MM.dd.HH.mm.ss");
 
-    // true if this SnapshotDaemon is the one responsible for generating
-    // snapshots
+    // true if this SnapshotDaemon is appointed the leader for snapshot truncation and automated snapshotting
+    private boolean m_isLeader = false;
+    // true if this SnapshotDaemon has been told to start taking automated snapshots (and is the leader).
     private boolean m_isActive = false;
     private long m_nextSnapshotTime;
 
@@ -362,6 +363,7 @@ public class SnapshotDaemon implements SnapshotCompletionInterest, Promotable {
             }, 0, 1, TimeUnit.HOURS);
             truncationRequestExistenceCheck();
             userSnapshotRequestExistenceCheck();
+            m_isLeader = true;
         }
         catch (Exception e) {
             VoltDB.crashLocalVoltDB("Exception in snapshot daemon electing master via ZK", true, e);
@@ -865,17 +867,34 @@ public class SnapshotDaemon implements SnapshotCompletionInterest, Promotable {
     }
 
     /**
-     * Make this SnapshotDaemon responsible for generating snapshots
+     * Tell this SnapshotDaemon to start generating snapshots, if it was appointed the leader.
+     * @throws ExecutionException
+     * @throws InterruptedException
      */
-    public Future<Void> makeActive(final SnapshotSchedule schedule)
+    public boolean makeActiveIfLeader(final SnapshotSchedule schedule) throws InterruptedException, ExecutionException
     {
-        return m_es.submit(new Callable<Void>() {
-            @Override
-            public Void call() throws Exception {
-                makeActivePrivate(schedule);
-                return null;
-            }
-        });
+        Future<Boolean> resultFuture = null;
+        if (m_isLeader && schedule != null && schedule.getEnabled()) {
+            resultFuture = m_es.submit(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    makeActivePrivate(schedule);
+                    return true;
+                }
+            });
+        }
+        else {
+            resultFuture = m_es.submit(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    m_isActive = false;
+                    m_snapshots.clear();
+                    return false;
+                }
+            });
+        }
+        Boolean result = resultFuture.get();
+        return result;
     }
 
     private void makeActivePrivate(final SnapshotSchedule schedule) {
@@ -915,16 +934,6 @@ public class SnapshotDaemon implements SnapshotCompletionInterest, Promotable {
                 }
             }
         }, 0, m_periodicWorkInterval, TimeUnit.MILLISECONDS);
-    }
-
-    public void makeInactive() {
-        m_es.execute(new Runnable() {
-            @Override
-            public void run() {
-                m_isActive = false;
-                m_snapshots.clear();
-            }
-        });
     }
 
     private class Snapshot implements Comparable<Snapshot> {

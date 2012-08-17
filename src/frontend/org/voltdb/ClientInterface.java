@@ -1194,23 +1194,18 @@ public class ClientInterface implements SnapshotDaemon.DaemonInitiator {
         });
     }
 
-    // if this ClientInterface's site ID is the lowest non-execution site ID
-    // in the cluster, make our SnapshotDaemon responsible for snapshots
+    /**
+     * Tell the snapshot daemon it can start making automated snapshots.  Only the snapshot daemon
+     * which has been appointed leader by the GlobalServiceElector will actually perform this work.
+     */
     public void mayActivateSnapshotDaemon() {
         SnapshotSchedule schedule = m_catalogContext.get().database.getSnapshotschedule().get("default");
-        if (VoltDB.instance().getSiteTracker().isFirstHost() &&
-            schedule != null && schedule.getEnabled())
-        {
-            Future<Void> future = m_snapshotDaemon.makeActive(schedule);
-            try {
-                future.get();
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
-            } catch (ExecutionException e) {
-                throw new RuntimeException(e.getCause());
-            }
-        } else {
-            m_snapshotDaemon.makeInactive();
+        try {
+            m_snapshotDaemon.makeActiveIfLeader(schedule);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e.getCause());
         }
     }
 

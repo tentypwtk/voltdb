@@ -670,13 +670,6 @@ public class RealVoltDB implements VoltDBInterface, RestoreAgent.Callback, Mailb
                 }
             }
 
-            // Start the GlobalServiceElector.  Not sure where this will actually belong.
-            try {
-                m_globalServiceElector.start();
-            } catch (Exception e) {
-                VoltDB.crashLocalVoltDB("Unable to start GlobalServiceElector", true, e);
-            }
-
             /*
              * At this point all of the execution sites have been published to m_localSites
              * It is possible that while they were being created the mailbox tracker found additional
@@ -779,6 +772,18 @@ public class RealVoltDB implements VoltDBInterface, RestoreAgent.Callback, Mailb
                 VoltDB.crashLocalVoltDB("Failed to validate cluster build string", false, e);
             }
 
+            assert(m_clientInterfaces.size() > 0);
+            ClientInterface ci = m_clientInterfaces.get(0);
+            ci.initializeSnapshotDaemon(m_messenger.getZK());
+            m_globalServiceElector.registerService(ci.getSnapshotDaemon());
+
+            // Start the GlobalServiceElector.  Not sure where this will actually belong.
+            try {
+                m_globalServiceElector.start();
+            } catch (Exception e) {
+                VoltDB.crashLocalVoltDB("Unable to start GlobalServiceElector", true, e);
+            }
+
             if (!isRejoin) {
                 try {
                     m_messenger.waitForAllHostsToBeReady(m_deployment.getCluster().getHostcount());
@@ -810,10 +815,6 @@ public class RealVoltDB implements VoltDBInterface, RestoreAgent.Callback, Mailb
             if (clusterConfig.getReplicationFactor() == 0) {
                 hostLog.warn("Running without redundancy (k=0) is not recommended for production use.");
             }
-
-            assert(m_clientInterfaces.size() > 0);
-            ClientInterface ci = m_clientInterfaces.get(0);
-            ci.initializeSnapshotDaemon(m_messenger.getZK());
 
             // set additional restore agent stuff
             TransactionInitiator initiator = m_dtxns.get(0);

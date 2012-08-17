@@ -66,7 +66,7 @@ import com.google.common.base.Throwables;
  * should merge them.
  *
  */
-public class SnapshotDaemon implements SnapshotCompletionInterest {
+public class SnapshotDaemon implements SnapshotCompletionInterest, Promotable {
     private class TruncationSnapshotAttempt {
         private String path;
         private String nonce;
@@ -216,14 +216,6 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
         if (threadLocalInit != null) {
             m_es.execute(threadLocalInit);
         }
-
-        // Really shouldn't leak this from a constructor, and twice to boot
-        m_es.execute(new Runnable() {
-            @Override
-            public void run() {
-                leaderElection();
-            }
-        });
     }
 
     /*
@@ -354,59 +346,27 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
         m_initiator.initiateSnapshotDaemonWork("@SnapshotDelete", handle, params);
     }
 
-    /**
-     * Leader election for snapshots.
-     * Leader will watch for truncation and user snapshot requests
-     */
-    private void leaderElection() {
-        loggingLog.info("Starting leader election for snapshot truncation daemon");
+    public void acceptPromotion()
+    {
         try {
-            while (true) {
-                Stat stat = m_zk.exists(VoltZK.snapshot_truncation_master, new Watcher() {
-                    @Override
-                    public void process(WatchedEvent event) {
-                        switch(event.getType()) {
-                        case NodeDeleted:
-                            loggingLog.info("Detected the snapshot truncation leader's ephemeral node deletion");
-                            m_es.execute(new Runnable() {
-                                @Override
-                                public void run() {
-                                    leaderElection();
-                                }
-                            });
-                            break;
-                            default:
-                                break;
-                        }
-                    }
-                });
-                if (stat == null) {
+            loggingLog.info("This node was selected as the leader for snapshot truncation");
+            m_truncationSnapshotScanTask = m_es.scheduleWithFixedDelay(new Runnable() {
+                @Override
+                public void run() {
                     try {
-                        m_zk.create(VoltZK.snapshot_truncation_master, null, Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
-                        loggingLog.info("This node was selected as the leader for snapshot truncation");
-                        m_truncationSnapshotScanTask = m_es.scheduleWithFixedDelay(new Runnable() {
-                            @Override
-                            public void run() {
-                                try {
-                                    scanTruncationSnapshots();
-                                } catch (Exception e) {
-                                    loggingLog.error("Error during scan and group of truncation snapshots");
-                                }
-                            }
-                        }, 0, 1, TimeUnit.HOURS);
-                        truncationRequestExistenceCheck();
-                        userSnapshotRequestExistenceCheck();
-                        return;
-                    } catch (NodeExistsException e) {
+                        scanTruncationSnapshots();
+                    } catch (Exception e) {
+                        loggingLog.error("Error during scan and group of truncation snapshots");
                     }
-                } else {
-                    loggingLog.info("Leader election concluded, a leader already exists");
-                    break;
                 }
-            }
-        } catch (Exception e) {
+            }, 0, 1, TimeUnit.HOURS);
+            truncationRequestExistenceCheck();
+            userSnapshotRequestExistenceCheck();
+        }
+        catch (Exception e) {
             VoltDB.crashLocalVoltDB("Exception in snapshot daemon electing master via ZK", true, e);
         }
+        return;
     }
 
     /*
@@ -886,7 +846,7 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
             processTruncationRequestEvent(new WatchedEvent(
                     EventType.NodeCreated,
                     KeeperState.SyncConnected,
-                    VoltZK.snapshot_truncation_master));
+                    VoltZK.request_truncation_snapshot));
         }
     }
 

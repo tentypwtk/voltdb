@@ -39,6 +39,8 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.jar.JarEntry;
 import java.util.jar.JarInputStream;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.xml.bind.JAXBContext;
 import javax.xml.bind.JAXBElement;
@@ -73,8 +75,8 @@ import org.voltdb.compiler.projectfile.ExportType.Tables;
 import org.voltdb.compiler.projectfile.GroupsType;
 import org.voltdb.compiler.projectfile.ProceduresType;
 import org.voltdb.compiler.projectfile.ProjectType;
+import org.voltdb.compiler.projectfile.RolesType;
 import org.voltdb.compiler.projectfile.SchemasType;
-import org.voltdb.compiler.projectfile.SecurityType;
 import org.voltdb.types.ConstraintType;
 import org.voltdb.utils.CatalogUtil;
 import org.voltdb.utils.Encoder;
@@ -243,6 +245,18 @@ public class VoltCompiler {
             m_singleStmt = null;
             m_joinOrder = null;
             m_partitionString = null;
+            m_builtInStmt = false;
+        }
+
+        ProcedureDescriptor (final ArrayList<String> authGroups, final String className, String partitionString) {
+            assert(className != null);
+            assert(partitionString != null);
+
+            m_authGroups = authGroups;
+            m_className = className;
+            m_singleStmt = null;
+            m_joinOrder = null;
+            m_partitionString = partitionString;
             m_builtInStmt = false;
         }
 
@@ -425,6 +439,18 @@ public class VoltCompiler {
                 compilerLog.error(e.getLinkedException().getMessage());
                 return null;
             }
+
+            DeprecatedProjectElement deprecated = DeprecatedProjectElement.valueOf(e);
+            if( deprecated != null) {
+                addErr("Found deprecated XML element \"" + deprecated.name() + "\" in project.xml file, "
+                        + deprecated.getSuggestion());
+                addErr("Error schema validating project.xml file. " + e.getLinkedException().getMessage());
+                compilerLog.error("Found deprecated XML element \"" + deprecated.name() + "\" in project.xml file");
+                compilerLog.error(e.getMessage());
+                compilerLog.error(projectFileURL);
+                return null;
+            }
+
             if (e.getLinkedException() instanceof org.xml.sax.SAXParseException) {
                 addErr("Error schema validating project.xml file. " + e.getLinkedException().getMessage());
                 compilerLog.error("Error schema validating project.xml file: " + e.getLinkedException().getMessage());
@@ -432,6 +458,7 @@ public class VoltCompiler {
                 compilerLog.error(projectFileURL);
                 return null;
             }
+
             throw new RuntimeException(e);
         }
         catch (SAXException e) {
@@ -471,13 +498,6 @@ public class VoltCompiler {
         m_catalog = new Catalog();
         temporaryCatalogInit();
 
-        SecurityType security = project.getSecurity();
-        if (security != null) {
-            m_catalog.getClusters().get("cluster").
-                setSecurityenabled(security.isEnabled());
-
-        }
-
         DatabaseType database = project.getDatabase();
         if (database != null) {
             compileDatabaseNode(database);
@@ -497,7 +517,7 @@ public class VoltCompiler {
         final ArrayList<String> schemas = new ArrayList<String>();
         final ArrayList<ProcedureDescriptor> procedures = new ArrayList<ProcedureDescriptor>();
         final ArrayList<Class<?>> classDependencies = new ArrayList<Class<?>>();
-        final TablePartitionMap partitionMap = new TablePartitionMap(this);
+        final PartitionMap partitionMap = new PartitionMap(this);
 
         final String databaseName = database.getName();
 
@@ -519,7 +539,7 @@ public class VoltCompiler {
             schemas.add(schema.getPath());
         }
 
-        // groups/group.
+        // groups/group (alias for roles/role).
         if (database.getGroups() != null) {
             for (GroupsType.Group group : database.getGroups().getGroup()) {
                 org.voltdb.catalog.Group catGroup = db.getGroups().add(group.getName());
@@ -529,10 +549,20 @@ public class VoltCompiler {
             }
         }
 
+        // roles/role (alias for groups/group).
+        if (database.getRoles() != null) {
+            for (RolesType.Role role : database.getRoles().getRole()) {
+                org.voltdb.catalog.Group catGroup = db.getGroups().add(role.getName());
+                catGroup.setAdhoc(role.isAdhoc());
+                catGroup.setSysproc(role.isSysproc());
+                catGroup.setDefaultproc(role.isDefaultproc());
+            }
+        }
+
         // procedures/procedure
         if (database.getProcedures() != null) {
             for (ProceduresType.Procedure proc : database.getProcedures().getProcedure()) {
-                procedures.add(getProcedure(proc));
+                partitionMap.add(getProcedure(proc));
             }
         }
 
@@ -561,7 +591,7 @@ public class VoltCompiler {
         // Actually parse and handle all the DDL
         // DDLCompiler also provides partition descriptors for DDL PARTITION
         // and REPLICATE statements.
-        final DDLCompiler ddlcompiler = new DDLCompiler(this, m_hsql, partitionMap);
+        final DDLCompiler ddlcompiler = new DDLCompiler(this, m_hsql, partitionMap, db.getGroups());
 
         for (final String schemaPath : schemas) {
             File schemaFile = null;
@@ -625,6 +655,7 @@ public class VoltCompiler {
                     case INTEGER:
                     case BIGINT:
                     case STRING:
+                    case VARBINARY:
                         break;
                     default:
                         msg += "Partition column '" + tableName + "." + colName + "' is not a valid type. " +
@@ -671,6 +702,9 @@ public class VoltCompiler {
         List<ProcedureDescriptor> autoCrudProcedures = generateCrud(m_catalog);
         procedures.addAll(autoCrudProcedures);
 
+        // Add procedures read from DDL and project file
+        procedures.addAll( partitionMap.getProcedureDescriptors());
+
         // Actually parse and handle all the Procedures
         for (final ProcedureDescriptor procedureDescriptor : procedures) {
             final String procedureName = procedureDescriptor.m_className;
@@ -690,7 +724,8 @@ public class VoltCompiler {
 
     }
 
-    static private void setGroupedTablePartitionColumn(MaterializedViewInfo mvi, Column partitionColumn) {
+    private void setGroupedTablePartitionColumn(MaterializedViewInfo mvi, Column partitionColumn)
+            throws VoltCompilerException {
         // A view of a replicated table is replicated.
         // A view of a partitioned table is partitioned -- regardless of whether it has a partition key
         // -- it certainly isn't replicated!
@@ -1213,6 +1248,11 @@ public class VoltCompiler {
                                                 "materialized view.  A view cannot be an export table.");
                     throw new VoltCompilerException("View configured as an export table");
                 }
+                if (tableref.getIndexes().size() > 0) {
+                    compilerLog.error("While configuring export, table " + tablename + " has indexes defined. " +
+                            "Export tables can't have indexes (including primary keys).");
+                    throw new VoltCompilerException("Table with indexes configured as an export table");
+                }
                 if (tableref.getIsreplicated()) {
                     // if you don't specify partition columns, make
                     // export tables partitioned, but on no specific column (iffy)
@@ -1450,5 +1490,60 @@ public class VoltCompiler {
      */
     public void setProcInfoOverrides(Map<String, ProcInfoData> procInfoOverrides) {
         m_procInfoOverrides = procInfoOverrides;
+    }
+
+    /**
+     * Helper enum that scans sax exception messages for deprecated xml elements
+     *
+     * @author ssantoro
+     */
+    enum DeprecatedProjectElement {
+        security(
+                "(?i)\\Acvc-[^:]+:\\s+Invalid\\s+content\\s+.+?\\s+element\\s+'security'",
+                "security may be enabled in the deployment file only"
+                );
+
+        /**
+         * message regular expression that pertains to the deprecated element
+         */
+        private final Pattern messagePattern;
+        /**
+         * a suggestion string to exaplain alternatives
+         */
+        private final String suggestion;
+
+        DeprecatedProjectElement(String messageRegex, String suggestion) {
+            this.messagePattern = Pattern.compile(messageRegex);
+            this.suggestion = suggestion;
+        }
+
+        String getSuggestion() {
+            return suggestion;
+        }
+
+        /**
+         * Given a JAXBException it determines whether or not the linked
+         * exception is associated with a deprecated xml elements
+         *
+         * @param jxbex a {@link JAXBException}
+         * @return an enum of {@code DeprecatedProjectElement} if the
+         *    given exception corresponds to a deprecated xml element
+         */
+        static DeprecatedProjectElement valueOf( JAXBException jxbex) {
+            if(    jxbex == null
+                || jxbex.getLinkedException() == null
+                || ! (jxbex.getLinkedException() instanceof org.xml.sax.SAXParseException)
+            ) {
+                return null;
+            }
+            org.xml.sax.SAXParseException saxex =
+                    org.xml.sax.SAXParseException.class.cast(jxbex.getLinkedException());
+            for( DeprecatedProjectElement dpe: DeprecatedProjectElement.values()) {
+                Matcher mtc = dpe.messagePattern.matcher(saxex.getMessage());
+                if( mtc.find()) return dpe;
+            }
+
+            return null;
+        }
     }
 }

@@ -843,7 +843,7 @@ public class TestSnapshotDaemon {
 
         JSONObject jsObj = new JSONObject((String)m_initiator.params[0]);
         assertTrue(jsObj.getString("path").equals("/foo"));
-        assertTrue(jsObj.length() == 2);
+        assertTrue(jsObj.length() == 3);
 
         handle = m_initiator.clientData;
         m_initiator.clear();
@@ -860,7 +860,7 @@ public class TestSnapshotDaemon {
         }
         assertNull(zk.exists(VoltZK.request_truncation_snapshot, false));
 
-        m_daemon.snapshotCompleted( "", 32, true).await();
+        m_daemon.snapshotCompleted("", 32, new long[0], true).await();
         assertTrue(m_initiator.procedureName.equals("@SnapshotDelete"));
 
         String nonces[] = (String[])m_initiator.params[1];

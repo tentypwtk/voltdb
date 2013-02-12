@@ -85,15 +85,28 @@ public class SSHTools {
             // Set the private key
             if (null != key)
                 jsch.addIdentity(key);
-            Session session=jsch.getSession(user, host, 22);
-            session.setTimeout(5000);
 
             // To avoid the UnknownHostKey issue
             java.util.Properties config = new java.util.Properties();
             config.put("StrictHostKeyChecking", "no");
-            session.setConfig(config);
 
-            session.connect();
+            Session session = null;
+            int r = 0;
+            while (true) {
+                try {
+                    session=jsch.getSession(user, host, 22);
+                    session.setTimeout(5000);
+                    session.setConfig(config);
+                    session.connect();
+                    if (session.isConnected())
+                        break;
+                }
+                catch (Exception e) {
+                    e.printStackTrace();
+                    Thread.sleep(100);
+                    if (++r > 10) { throw e; }
+                }
+            }
 
             Channel channel = session.openChannel("exec");
             ((ChannelExec) channel).setCommand(command);
@@ -150,14 +163,27 @@ public class SSHTools {
             // Set the private key
             if (null != m_keyFile)
                 jsch.addIdentity(m_keyFile);
-            Session session=jsch.getSession(m_username, hostname, 22);
 
             // To avoid the UnknownHostKey issue
             java.util.Properties config = new java.util.Properties();
             config.put("StrictHostKeyChecking", "no");
-            session.setConfig(config);
 
-            session.connect(5000); // timeout after 5 seconds.
+            Session session = null;
+            int r = 0;
+            while (true) {
+                try {
+                    session=jsch.getSession(m_username, hostname, 22);
+                    session.setConfig(config);
+                    session.connect(5000);
+                    if (session.isConnected())
+                        break;
+                }
+                catch (Exception e) {
+                    e.printStackTrace();
+                    Thread.sleep(100);
+                    if (++r > 10) { throw e; }
+                }
+            }
 
             return new ProcessData(processName, handler, session, stringify(command));
         }
@@ -190,14 +216,27 @@ public class SSHTools {
             // Set the private key
             if (null != key)
                 jsch.addIdentity(key);
-            Session session=jsch.getSession(user, host, 22);
 
             // To avoid the UnknownHostKey issue
             java.util.Properties config = new java.util.Properties();
             config.put("StrictHostKeyChecking", "no");
-            session.setConfig(config);
 
-            session.connect(5000); // timeout after 5 seconds
+            Session session = null;
+            int r = 0;
+            while (true) {
+                try {
+                    session = jsch.getSession(user, host, 22);
+                    session.setConfig(config);
+                    session.connect(5000);
+                    if (session.isConnected())
+                        break;
+                }
+                catch (Exception e) {
+                    e.printStackTrace();
+                    Thread.sleep(100);
+                    if (++r > 10) { throw e; }
+                }
+            }
 
             // exec 'scp -t rfile' remotely
             Channel channel=session.openChannel("exec");

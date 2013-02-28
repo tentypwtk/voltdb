@@ -506,6 +506,9 @@ def load_verbspace(command_name, command_dir, config, version, description, pack
                         % (command_name, version, command_dir))
     scan_base_dirs = [os.path.dirname(__file__)]
     verbs_subdir = '%s.d' % command_name
+    # Add enterprise paths if VOLTPRO is set.
+    if 'VOLTPRO' in os.environ:
+        scan_base_dirs.append(os.path.join(os.environ['VOLTPRO'], 'lib', 'python', 'voltcli'))
     if command_dir is not None and command_dir not in scan_base_dirs:
         scan_base_dirs.append(command_dir)
     cwd = os.getcwd()

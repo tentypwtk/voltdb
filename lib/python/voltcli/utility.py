@@ -261,11 +261,13 @@ class PythonSourceFinder(object):
                         except (IOError, OSError), e:
                             abort('Failed to load package resource "%s".' % path, e)
                         syms_tmp = copy.copy(syms)
+                        syms_tmp['__file__'] = path
                         exec(code, syms_tmp)
             elif os.path.exists(scan_loc.path):
                 for modpath in glob.glob(os.path.join(scan_loc.path, '*.py')):
                     debug('Executing module "%s"...' % modpath)
                     syms_tmp = copy.copy(syms)
+                    syms_tmp['__file__'] = modpath
                     execfile(modpath, syms_tmp)
 
 #===============================================================================

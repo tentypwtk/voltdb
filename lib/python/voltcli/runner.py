@@ -504,16 +504,40 @@ def load_verbspace(command_name, command_dir, config, version, description, pack
     """
     utility.debug('Loading verbspace for "%s" version "%s" from "%s"...'
                         % (command_name, version, command_dir))
-    scan_base_dirs = [os.path.dirname(__file__)]
+
+    #=== Build a list of directories to scan for modules in .d subdirectories.
+
     verbs_subdir = '%s.d' % command_name
-    # Add enterprise paths if VOLTPRO is set.
+    scan_base_dirs = []
+
+    def check_scan_base_dir(dir):
+        if dir:
+            d = os.path.realpath(dir)
+            if os.path.isdir(d) and d not in scan_base_dirs:
+                scan_base_dirs.append(d)
+
+    # Add the enterprise library path based on VOLTPRO, if set.
     if 'VOLTPRO' in os.environ:
-        scan_base_dirs.append(os.path.join(os.environ['VOLTPRO'], 'lib', 'python', 'voltcli'))
-    if command_dir is not None and command_dir not in scan_base_dirs:
-        scan_base_dirs.append(command_dir)
+        check_scan_base_dir(os.path.join(os.environ['VOLTPRO'], 'lib', 'python', 'voltcli'))
+
+    # Use this files directory as a search location for .d subdirectories.
+    check_scan_base_dir(os.path.dirname(__file__))
+
+    # If the main command script directory is known look for modules under it.
+    if command_dir is not None:
+        check_scan_base_dir(command_dir)
+
+    # Search under the current working directory.
     cwd = os.getcwd()
-    if cwd not in scan_base_dirs:
-        scan_base_dirs.append(cwd)
+    check_scan_base_dir(cwd)
+
+    # Finally, crawl up all parent directories and look for lib/python/voltcli.
+    d = cwd
+    while True:
+        check_scan_base_dir(os.path.join(d, 'lib', 'python', 'voltcli'))
+        if d == '/':
+            break
+        d = os.path.dirname(d)
 
     # Build the VOLT namespace with the specific set of classes, functions and
     # decorators we make available to command implementations.

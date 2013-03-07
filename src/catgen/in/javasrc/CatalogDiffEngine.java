@@ -21,8 +21,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.TreeMap;
-import java.util.TreeSet;
 
 import org.voltdb.VoltType;
 import org.voltdb.types.ConstraintType;
@@ -46,12 +46,9 @@ public class CatalogDiffEngine {
      * and after.
      */
     private static class FieldChange {
-        final CatalogType newType;
-        final CatalogType prevType;
+        CatalogType newType = null;
+        CatalogType prevType = null;
         final List<String> changedFields = new ArrayList<String>();
-        FieldChange(CatalogType newType, CatalogType prevType) {
-            this.newType = newType; this.prevType = prevType;
-        }
     }
 
     /**
@@ -61,7 +58,12 @@ public class CatalogDiffEngine {
     private enum DiffClass {
         PROC (Procedure.class),
         TABLE (Table.class),
-        OTHER (Catalog.class);
+        USER (User.class),
+        GROUP (Group.class),
+        //CONNECTOR (Connector.class),
+        //SCHEDULE (SnapshotSchedule.class),
+        //CLUSTER (Cluster.class),
+        OTHER (Catalog.class); // catch all
 
         final Class<?> clz;
 
@@ -70,19 +72,31 @@ public class CatalogDiffEngine {
         }
 
         static DiffClass get(CatalogType type) {
+            // this exits because eventually OTHER will catch everything
             while (true) {
-                if (type instanceof Catalog) {
-                    return OTHER;
-                }
-                if (type instanceof Procedure) {
-                    return PROC;
-                }
-                if (type instanceof Table) {
-                    return TABLE;
+                for (DiffClass dc : DiffClass.values()) {
+                    if (type.getClass() == dc.clz) {
+                        return dc;
+                    }
                 }
                 type = type.getParent();
             }
         }
+    }
+
+    class MetaNodeChanges {
+        CatalogType metaNode = null;
+
+        // nodes added under a clz instance, mapped from their parent
+        final List<CatalogType> additions = new ArrayList<CatalogType>();
+        // nodes dropped from under a clz instance, mapped from their parent
+        final List<CatalogType> deletions = new ArrayList<CatalogType>();
+
+        FieldChange changes = new FieldChange();
+
+        // all fields changed for a clz instance and any fields changed by children
+        // map from base clz instance to node to the field changes to the FieldChange instance
+        final Map<CatalogType, FieldChange> childChanges = new TreeMap<CatalogType, FieldChange>();
     }
 
     /**
@@ -99,13 +113,8 @@ public class CatalogDiffEngine {
         List<CatalogType> additions = new ArrayList<CatalogType>();
         // nodes of type clz dropped
         List<CatalogType> deletions = new ArrayList<CatalogType>();
-        // nodes added under a clz instance, mapped from their parent
-        Map<CatalogType, List<CatalogType>> childAdditions = new TreeMap<CatalogType, List<CatalogType>>();
-        // nodes dropped from under a clz instance, mapped from their parent
-        Map<CatalogType, List<CatalogType>> childDeletions = new TreeMap<CatalogType, List<CatalogType>>();
-        // all fields changed for a clz instance and any fields changed by children
-        // map from base clz instance to node to the field changes to the FieldChange instance
-        Map<CatalogType, Map<CatalogType, FieldChange>> childChanges = new TreeMap<CatalogType, Map<CatalogType, FieldChange>>();
+
+        Map<CatalogType, MetaNodeChanges> changes = new TreeMap<CatalogType, MetaNodeChanges>();
 
         ChangeGroup(DiffClass diffClass) {
             clz = diffClass.clz;
@@ -121,30 +130,32 @@ public class CatalogDiffEngine {
                 parent = parent.getParent();
             }
 
-            List<CatalogType> localAdds = childAdditions.get(parent);
-            if (localAdds == null) {
-                localAdds = new ArrayList<CatalogType>();
-                childAdditions.put(parent, localAdds);
+            MetaNodeChanges metaChanges = changes.get(parent);
+            if (metaChanges == null) {
+                metaChanges = new MetaNodeChanges();
+                metaChanges.metaNode = parent;
+                changes.put(parent, metaChanges);
             }
-            localAdds.add(type);
+            metaChanges.additions.add(type);
         }
 
-        void processDeletion(CatalogType type) {
+        void processDeletion(CatalogType type, CatalogType newlyChildlessParent) {
             if (type.getClass().equals(clz)) {
                 deletions.add(type);
                 return;
             }
-            CatalogType parent = type.getParent();
+            // need to use a parent from the new tree, not the old one
+            CatalogType parent = newlyChildlessParent;
             while (parent.getClass().equals(clz) == false) {
                 parent = parent.getParent();
             }
 
-            List<CatalogType> localAdds = childDeletions.get(parent);
-            if (localAdds == null) {
-                localAdds = new ArrayList<CatalogType>();
-                childDeletions.put(parent, localAdds);
+            MetaNodeChanges metaChanges = changes.get(parent);
+            if (metaChanges == null) {
+                metaChanges = new MetaNodeChanges();
+                changes.put(parent, metaChanges);
             }
-            localAdds.add(type);
+            metaChanges.deletions.add(type);
         }
 
         void processChange(CatalogType newType, CatalogType prevType, String field) {
@@ -153,16 +164,27 @@ public class CatalogDiffEngine {
                 parent = parent.getParent();
             }
 
-            Map<CatalogType, FieldChange> changes = childChanges.get(parent);
-            if (changes == null) {
-                changes = new TreeMap<CatalogType, FieldChange>();
-                childChanges.put(parent, changes);
+            MetaNodeChanges metaChanges = changes.get(parent);
+            if (metaChanges == null) {
+                metaChanges = new MetaNodeChanges();
+                changes.put(parent, metaChanges);
             }
-            FieldChange fc = changes.get(newType);
-            if (fc == null) {
-                fc = new FieldChange(newType, prevType);
-                changes.put(newType, fc);
+
+            FieldChange fc = null;
+
+            // object equality is intentional here
+            if (parent == newType) {
+                fc = metaChanges.changes;
             }
+            else {
+                fc = metaChanges.childChanges.get(newType);
+                if (fc == null) {
+                    fc = new FieldChange();
+                    metaChanges.childChanges.put(newType, fc);
+                }
+            }
+            fc.newType = newType; // might be setting this twice, but no harm done
+            fc.prevType = prevType; // ditto
             fc.changedFields.add(field);
         }
     }
@@ -537,7 +559,7 @@ public class CatalogDiffEngine {
     /**
      * Add a deletion
      */
-    private void writeDeletion(CatalogType prevType, String mapName, String name)
+    private void writeDeletion(CatalogType prevType, CatalogType newlyChildlessParent, String mapName, String name)
     {
         // verify this is possible, write an error and mark return code false if so
         checkAddDropWhitelist(prevType, ChangeType.DELETION);
@@ -549,7 +571,7 @@ public class CatalogDiffEngine {
 
         // add it to the set of deletions to later compute descriptive text
         ChangeGroup cgrp = m_changes.get(DiffClass.get(prevType));
-        cgrp.processDeletion(prevType);
+        cgrp.processDeletion(prevType, newlyChildlessParent);
     }
 
     /**
@@ -646,7 +668,7 @@ public class CatalogDiffEngine {
             String name = prevType.getTypeName();
             CatalogType newType = newMap.get(name);
             if (newType == null) {
-                writeDeletion(prevType, mapName, name);
+                writeDeletion(prevType, newMap.m_parent, mapName, name);
                 continue;
             }
 
@@ -661,12 +683,28 @@ public class CatalogDiffEngine {
         }
     }
 
-    private boolean isCRUDProc(Procedure proc) {
-        if (proc.getTypeName().endsWith(".select")) return true;
-        if (proc.getTypeName().endsWith(".insert")) return true;
-        if (proc.getTypeName().endsWith(".delete")) return true;
-        if (proc.getTypeName().endsWith(".update")) return true;
-        return false;
+    interface Filter {
+        public boolean include(CatalogType type);
+    }
+
+    private void basicMetaChangeDesc(StringBuilder sb, DiffClass dc, Filter filter) {
+        ChangeGroup group = m_changes.get(dc);
+
+        for (CatalogType type : group.deletions) {
+            if ((filter != null) && !filter.include(type)) continue;
+            sb.append(String.format("%s %s dropped.\n",
+                    type.getClass().getSimpleName(), type.getTypeName()));
+        }
+        for (CatalogType type : group.additions) {
+            if ((filter != null) && !filter.include(type)) continue;
+            sb.append(String.format("%s %s added.\n",
+                    type.getClass().getSimpleName(), type.getTypeName()));
+        }
+        for (Entry<CatalogType, MetaNodeChanges> entry : group.changes.entrySet()) {
+            if ((filter != null) && !filter.include(entry.getKey())) continue;
+            sb.append(String.format("%s %s has been modified.\n",
+                    entry.getKey().getClass().getSimpleName(), entry.getKey().getTypeName()));
+        }
     }
 
     /**
@@ -679,66 +717,43 @@ public class CatalogDiffEngine {
         StringBuilder sb = new StringBuilder();
 
         // DESCRIBE TABLE CHANGES
-        ChangeGroup group = m_changes.get(DiffClass.TABLE);
-
-        for (CatalogType type : group.deletions) {
-            sb.append(String.format("Table %s dropped.\n", type.getTypeName()));
-        }
-
-        for (CatalogType type : group.additions) {
-            sb.append(String.format("Table %s added.\n", type.getTypeName()));
-        }
-
-        TreeSet<CatalogType> changedTables = new TreeSet<CatalogType>();
-        changedTables.addAll(group.childAdditions.keySet());
-        changedTables.addAll(group.childDeletions.keySet());
-        changedTables.addAll(group.childChanges.keySet());
-        for (CatalogType type : changedTables) {
-            sb.append(String.format("Table %s has been modified.\n", type.getTypeName()));
-        }
+        basicMetaChangeDesc(sb, DiffClass.TABLE, null);
 
         // DESCRIBE PROCEDURE CHANGES
-        group = m_changes.get(DiffClass.PROC);
-
-        for (CatalogType type : group.deletions) {
-            if (isCRUDProc((Procedure) type)) continue;
-            sb.append(String.format("Procedure %s dropped.\n", type.getTypeName()));
+        class CRUDProcFilter implements Filter  {
+            @Override
+            public boolean include(CatalogType type) {
+                if (type.getTypeName().endsWith(".select")) return false;
+                if (type.getTypeName().endsWith(".insert")) return false;
+                if (type.getTypeName().endsWith(".delete")) return false;
+                if (type.getTypeName().endsWith(".update")) return false;
+                return true;
+            }
         }
+        basicMetaChangeDesc(sb, DiffClass.PROC, new CRUDProcFilter());
 
-        for (CatalogType type : group.additions) {
-            if (isCRUDProc((Procedure) type)) continue;
-            sb.append(String.format("Procedure %s added.\n", type.getTypeName()));
-        }
+        // DESCRIBE USER AND GROUP CHANGES
+        basicMetaChangeDesc(sb, DiffClass.GROUP, null);
 
-        TreeSet<CatalogType> changedProcs = new TreeSet<CatalogType>();
-        changedProcs.addAll(group.childAdditions.keySet());
-        changedProcs.addAll(group.childDeletions.keySet());
-        changedProcs.addAll(group.childChanges.keySet());
-        for (CatalogType type : changedProcs) {
-            if (isCRUDProc((Procedure) type)) continue;
-            sb.append(String.format("Procedure %s has been modified.\n", type.getTypeName()));
-        }
+        // note that since users are in the deployment file, they might not show up in all diffs
+        basicMetaChangeDesc(sb, DiffClass.USER, null);
 
         // DESCRIBE OTHER CHANGES
-        group = m_changes.get(DiffClass.OTHER);
+        ChangeGroup group = m_changes.get(DiffClass.OTHER);
 
         assert(group.additions.size() == 0);
         assert(group.deletions.size() == 0);
 
-        for (List<CatalogType> types : group.childAdditions.values()) {
-            for (CatalogType type : types) {
+        for (MetaNodeChanges metaChanges : group.changes.values()) {
+            for (CatalogType type : metaChanges.additions) {
                 sb.append(String.format("Catalog node %s of type %s has been added.\n",
                         type.getTypeName(), type.getClass().getSimpleName()));
             }
-        }
-        for (List<CatalogType> types : group.childDeletions.values()) {
-            for (CatalogType type : types) {
+            for (CatalogType type : metaChanges.deletions) {
                 sb.append(String.format("Catalog node %s of type %s has been removed.\n",
                         type.getTypeName(), type.getClass().getSimpleName()));
             }
-        }
-        for (Map<CatalogType, FieldChange> changes : group.childChanges.values()) {
-            for (FieldChange fc : changes.values()) {
+            for (FieldChange fc : metaChanges.childChanges.values()) {
                 // skip the database node which has a schema field that changes, but is covered elsewhere
                 if (fc.newType instanceof Database) {
                     continue;

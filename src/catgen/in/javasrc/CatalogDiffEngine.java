@@ -692,17 +692,17 @@ public class CatalogDiffEngine {
 
         for (CatalogType type : group.deletions) {
             if ((filter != null) && !filter.include(type)) continue;
-            sb.append(String.format("%s %s dropped.\n",
+            sb.append(String.format("  %s %s dropped.\n",
                     type.getClass().getSimpleName(), type.getTypeName()));
         }
         for (CatalogType type : group.additions) {
             if ((filter != null) && !filter.include(type)) continue;
-            sb.append(String.format("%s %s added.\n",
+            sb.append(String.format("  %s %s added.\n",
                     type.getClass().getSimpleName(), type.getTypeName()));
         }
         for (Entry<CatalogType, MetaNodeChanges> entry : group.changes.entrySet()) {
             if ((filter != null) && !filter.include(entry.getKey())) continue;
-            sb.append(String.format("%s %s has been modified.\n",
+            sb.append(String.format("  %s %s has been modified.\n",
                     entry.getKey().getClass().getSimpleName(), entry.getKey().getTypeName()));
         }
     }
@@ -716,10 +716,28 @@ public class CatalogDiffEngine {
     public String getDescriptionOfChanges() {
         StringBuilder sb = new StringBuilder();
 
+        sb.append("Catalog Difference Report\n");
+        sb.append("=========================\n");
+        if (supported()) {
+            sb.append("  This change is supported without stopping VoltDB.\n");
+            if (requiresSnapshotIsolation()) {
+                sb.append("  This change must occur when no snapshot is running.\n");
+                sb.append("  If a snapshot is in progress, the system may block \n" +
+                		  "  until the snspshot is complete to make the changes.\n");
+            }
+        }
+        else {
+            sb.append("  Making this change requires restarting VoltDB.\n");
+        }
+        sb.append("\n");
+
         // DESCRIBE TABLE CHANGES
+        sb.append("TABLE CHANGES:\n");
         basicMetaChangeDesc(sb, DiffClass.TABLE, null);
+        sb.append("\n");
 
         // DESCRIBE PROCEDURE CHANGES
+        sb.append("PROCEDURE CHANGES:\n");
         class CRUDProcFilter implements Filter  {
             @Override
             public boolean include(CatalogType type) {
@@ -731,14 +749,18 @@ public class CatalogDiffEngine {
             }
         }
         basicMetaChangeDesc(sb, DiffClass.PROC, new CRUDProcFilter());
+        sb.append("\n");
 
         // DESCRIBE USER AND GROUP CHANGES
+        sb.append("SECURITY CHANGES:\n");
         basicMetaChangeDesc(sb, DiffClass.GROUP, null);
 
         // note that since users are in the deployment file, they might not show up in all diffs
         basicMetaChangeDesc(sb, DiffClass.USER, null);
+        sb.append("\n");
 
         // DESCRIBE OTHER CHANGES
+        sb.append("OTHER CHANGES:\n");
         ChangeGroup group = m_changes.get(DiffClass.OTHER);
 
         assert(group.additions.size() == 0);

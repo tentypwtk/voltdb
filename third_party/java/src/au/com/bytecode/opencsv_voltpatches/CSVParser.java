@@ -29,6 +29,9 @@ import java.util.List;
  */
 public class CSVParser {
 
+    private int linesRead = 0;
+    private int multilinesRead = 0;
+
     private final char separator;
 
     private final char quotechar;
@@ -187,6 +190,7 @@ public class CSVParser {
      * @throws IOException if bad things happen during the read
      */
     private String[] parseLine(String nextLine, boolean multi) throws IOException {
+        linesRead++;
 
         if (!multi && pending != null) {
             pending = null;
@@ -248,6 +252,7 @@ public class CSVParser {
                     }
 
                     inQuotes = !inQuotes;
+                    multilinesRead=0; // reset counter, reached end of quoted field which may have spanned multiple lines
                 }
                 inField = !inField;
             } else if (c == separator && !inQuotes) {
@@ -264,6 +269,12 @@ public class CSVParser {
         // line is done - check status
         if (inQuotes) {
             if (multi) {
+                // output the first line of multi-line fields to help debug potential data issues
+                multilinesRead++;
+                if (multilinesRead == 1) {
+                    System.out.println("Found a multi-line field beginning on line " + linesRead + ":");
+                    System.out.println(sb.toString());
+                }
                 // continuing a quoted section, re-append newline
                 sb.append("\n");
                 pending = sb.toString();

@@ -50,6 +50,7 @@ import org.json_voltpatches.JSONObject;
 import org.voltcore.logging.VoltLogger;
 import org.voltcore.network.Connection;
 import org.voltcore.utils.CoreUtils;
+import org.voltcore.zk.ZKUtil;
 import org.voltdb.catalog.SnapshotSchedule;
 import org.voltdb.client.ClientResponse;
 import org.voltdb.client.ProcedureCallback;
@@ -121,13 +122,16 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
     private String m_prefixAndSeparator;
     private Future<?> m_snapshotTask;
 
+    private SnapshotSchedule m_lastKnownSchedule = null;
+
     private final HashMap<Long, ProcedureCallback> m_procedureCallbacks = new HashMap<Long, ProcedureCallback>();
 
     private final SimpleDateFormat m_dateFormat = new SimpleDateFormat("'_'yyyy.MM.dd.HH.mm.ss");
 
     // true if this SnapshotDaemon is the one responsible for generating
     // snapshots
-    private boolean m_isActive = false;
+    private boolean m_isAutoSnapshotLeader = false;
+    private Future<?> m_autoSnapshotTask = null;
     private long m_nextSnapshotTime;
 
     /**
@@ -241,6 +245,10 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
                         @Override
                         public void run() {
                             try {
+                                m_isAutoSnapshotLeader = true;
+                                if (m_lastKnownSchedule != null) {
+                                    makeActivePrivate(m_lastKnownSchedule);
+                                }
                                 electedTruncationLeader();
                             } catch (Exception e) {
                                 VoltDB.crashLocalVoltDB("Exception in snapshot daemon electing master via ZK", true, e);
@@ -431,6 +439,10 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
                 if (stat == null) {
                     try {
                         m_zk.create(VoltZK.snapshot_truncation_master, null, Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+                        m_isAutoSnapshotLeader = true;
+                        if (m_lastKnownSchedule != null) {
+                            makeActivePrivate(m_lastKnownSchedule);
+                        }
                         electedTruncationLeader();
                         return;
                     } catch (NodeExistsException e) {
@@ -492,12 +504,16 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
             }, m_truncationGatheringPeriod, TimeUnit.SECONDS);
             return;
         } else {
-            loggingLog.info("Truncation request event was not type created: " + event.getType());
-            try {
-                truncationRequestExistenceCheck();
-            } catch (Exception e) {
-                VoltDB.crashLocalVoltDB("Error resetting truncation request existence check", true, e);
-            }
+            /*
+             * We are very careful to cancel the watch if we find that a truncation requests exists. We are
+             * the only thread and daemon that should delete the node or change the data and the watch
+             * isn't set when that happens because it is part of processing the request and the watch should
+             * either be canceled or have already fired.
+             */
+            VoltDB.crashLocalVoltDB(
+                    "Trunction request watcher fired with event type other then created: " + event.getType(),
+                    true,
+                    null);
         }
     }
 
@@ -687,26 +703,25 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
         return;
     }
 
+    private TruncationRequestExistenceWatcher m_currentTruncationWatcher = new TruncationRequestExistenceWatcher();
     /*
      * Watcher that handles changes to the ZK node for
      * internal truncation snapshot requests
      */
-    private final Watcher m_truncationRequestExistenceWatcher = new Watcher() {
+    private class TruncationRequestExistenceWatcher extends ZKUtil.CancellableWatcher {
+
+        public TruncationRequestExistenceWatcher() {
+            super(m_es);
+        }
 
         @Override
-        public void process(final WatchedEvent event) {
+        public void pProcess(final WatchedEvent event) {
             if (event.getState() == KeeperState.Disconnected) return;
-
-            m_es.execute(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        processTruncationRequestEvent(event);
-                    } catch (Exception e) {
-                        VoltDB.crashLocalVoltDB("Error procesing truncation request event", true, e);
-                    }
-                }
-            });
+            try {
+                processTruncationRequestEvent(event);
+            } catch (Exception e) {
+                VoltDB.crashLocalVoltDB("Error procesing truncation request event", true, e);
+            }
         }
     };
 
@@ -1014,8 +1029,11 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
      */
     void truncationRequestExistenceCheck() throws KeeperException, InterruptedException {
         loggingLog.info("Checking for existence of snapshot truncation request");
-        if (m_zk.exists(VoltZK.request_truncation_snapshot, m_truncationRequestExistenceWatcher) != null) {
+        m_currentTruncationWatcher.cancel();
+        m_currentTruncationWatcher = new TruncationRequestExistenceWatcher();
+        if (m_zk.exists(VoltZK.request_truncation_snapshot, m_currentTruncationWatcher) != null) {
             loggingLog.info("A truncation request node already existed, processing truncation request event");
+            m_currentTruncationWatcher.cancel();
             processTruncationRequestEvent(new WatchedEvent(
                     EventType.NodeCreated,
                     KeeperState.SyncConnected,
@@ -1042,7 +1060,7 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
     /**
      * Make this SnapshotDaemon responsible for generating snapshots
      */
-    public ListenableFuture<Void> makeActive(final SnapshotSchedule schedule)
+    public ListenableFuture<Void> mayGoActiveOrInactive(final SnapshotSchedule schedule)
     {
         return m_es.submit(new Callable<Void>() {
             @Override
@@ -1054,49 +1072,63 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
     }
 
     private void makeActivePrivate(final SnapshotSchedule schedule) {
-        m_isActive = true;
-        m_frequency = schedule.getFrequencyvalue();
-        m_retain = schedule.getRetain();
-        m_path = schedule.getPath();
-        m_prefix = schedule.getPrefix();
-        m_prefixAndSeparator = m_prefix + "_";
-        final String frequencyUnitString = schedule.getFrequencyunit().toLowerCase();
-        assert(frequencyUnitString.length() == 1);
-        final char frequencyUnit = frequencyUnitString.charAt(0);
+        m_lastKnownSchedule = schedule;
+        if (schedule.getEnabled()) {
+            m_frequency = schedule.getFrequencyvalue();
+            m_retain = schedule.getRetain();
+            m_path = schedule.getPath();
+            m_prefix = schedule.getPrefix();
+            m_prefixAndSeparator = m_prefix + "_";
+            final String frequencyUnitString = schedule.getFrequencyunit().toLowerCase();
+            assert(frequencyUnitString.length() == 1);
+            final char frequencyUnit = frequencyUnitString.charAt(0);
 
-        switch (frequencyUnit) {
-        case 's':
-            m_frequencyUnit = TimeUnit.SECONDS;
-            break;
-        case 'm':
-            m_frequencyUnit = TimeUnit.MINUTES;
-            break;
-        case 'h':
-            m_frequencyUnit = TimeUnit.HOURS;
-            break;
-            default:
-                throw new RuntimeException("Frequency unit " + frequencyUnitString + "" +
-                        " in snapshot schedule is not one of d,m,h");
+            switch (frequencyUnit) {
+            case 's':
+                m_frequencyUnit = TimeUnit.SECONDS;
+                break;
+            case 'm':
+                m_frequencyUnit = TimeUnit.MINUTES;
+                break;
+            case 'h':
+                m_frequencyUnit = TimeUnit.HOURS;
+                break;
+                default:
+                    throw new RuntimeException("Frequency unit " + frequencyUnitString + "" +
+                            " in snapshot schedule is not one of d,m,h");
+            }
+            m_frequencyInMillis = TimeUnit.MILLISECONDS.convert( m_frequency, m_frequencyUnit);
+            m_nextSnapshotTime = System.currentTimeMillis() + m_frequencyInMillis;
         }
-        m_frequencyInMillis = TimeUnit.MILLISECONDS.convert( m_frequency, m_frequencyUnit);
-        m_nextSnapshotTime = System.currentTimeMillis() + m_frequencyInMillis;
-        m_es.scheduleAtFixedRate(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    doPeriodicWork(System.currentTimeMillis());
-                } catch (Exception e) {
-                    SNAP_LOG.warn("Error doing periodic snapshot management work", e);
+
+        if (m_isAutoSnapshotLeader) {
+            if (schedule.getEnabled()) {
+                if (m_autoSnapshotTask == null) {
+                    m_autoSnapshotTask = m_es.scheduleAtFixedRate(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                doPeriodicWork(System.currentTimeMillis());
+                            } catch (Exception e) {
+                                SNAP_LOG.warn("Error doing periodic snapshot management work", e);
+                            }
+                        }
+                    }, 0, m_periodicWorkInterval, TimeUnit.MILLISECONDS);
+                }
+            } else {
+                if (m_autoSnapshotTask != null) {
+                    m_autoSnapshotTask.cancel(false);
+                    m_autoSnapshotTask = null;
                 }
             }
-        }, 0, m_periodicWorkInterval, TimeUnit.MILLISECONDS);
+        }
     }
 
     public void makeInactive() {
         m_es.execute(new Runnable() {
             @Override
             public void run() {
-                m_isActive = false;
+
                 m_snapshots.clear();
             }
         });
@@ -1133,7 +1165,7 @@ public class SnapshotDaemon implements SnapshotCompletionInterest {
      * @return null if there is no work to do or a sysproc with parameters if there is work
      */
     private void doPeriodicWork(final long now) {
-        if (!m_isActive)
+        if (m_lastKnownSchedule == null)
         {
             setState(State.STARTUP);
             return;
